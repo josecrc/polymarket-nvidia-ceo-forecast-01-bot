@@ -35,41 +35,66 @@ const price6 = (x: number): number => {
 /**
  * Adaptive forecasting model with realized volatility estimation.
  */
-function forecast(m: CaseMarket, horizon: number): number[][] {
-  const p = m.prices;
-  if (!p || p.length === 0) throw new Error(`Market ${m.id} has no prices`);
-  const x = p[p.length - 1] as number;
-
-  // Estimate realized volatility using squared diffs over the trailing window (120 min max)
-  const win = Math.min(p.length - 1, 120);
-  let ssq = 0;
-  for (let i = p.length - win; i < p.length; i++) {
-    const diff = p[i] - p[i - 1];
-    ssq += diff * diff;
+/**
+ * Compute empirical realized volatility over the specified lookback window.
+ * Calculates root-mean-square of consecutive 1-minute price differentials.
+ */
+function computeRealizedVolatility(priceSeries: number[], windowMinutes: number = 120): number {
+  const effectiveWindow = Math.min(priceSeries.length - 1, windowMinutes);
+  if (effectiveWindow <= 0) return 0.001;
+  let sumSquaredDiff = 0;
+  for (let idx = priceSeries.length - effectiveWindow; idx < priceSeries.length; idx++) {
+    const delta = priceSeries[idx] - priceSeries[idx - 1];
+    sumSquaredDiff += delta * delta;
   }
-  const empiricalVol = win > 0 ? Math.sqrt(ssq / win) : 0.001;
-  // Apply calibrated scaling parameter 0.38 with protective bounding
-  const sigma = Math.min(0.003, Math.max(0.0001, empiricalVol * 0.38));
-
-  const rows: number[][] = [];
-  for (let h = 1; h <= horizon; h++) {
-    // Sublinear diffusion scaling Math.pow(h, 0.6) for fat tails and long-range clustering
-    const diff = Math.pow(h, 0.6);
-    const row = Z.map((z) => price6(x + z * sigma * diff));
-    rows.push(row);
-  }
-  return rows;
+  return Math.sqrt(sumSquaredDiff / effectiveWindow);
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
-
-for (const file of inputs) {
-  const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  if (c.quantiles.length !== QUANTILES.length || c.quantiles.some((t, j) => t !== QUANTILES[j])) {
-    throw new Error(`Unexpected quantiles specification in ${file}`);
+/**
+ * Generate 5 calibrated quantile trajectories for a single market across the forecast horizon.
+ * Incorporates 0.38 volatility scaling, sublinear diffusion (h^0.6), and quantile spreads.
+ */
+function forecastMarket(market: CaseMarket, horizonMinutes: number): number[][] {
+  const prices = market.prices;
+  if (!prices || prices.length === 0) {
+    throw new Error(`Market ${market.id} contains no price history`);
   }
-  const forecasts = c.markets.map((m) => ({ id: m.id, q: forecast(m, c.horizon_minutes) }));
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
+  const lastPrice = prices[prices.length - 1] as number;
+  const empiricalVol = computeRealizedVolatility(prices, 120);
+  const calibratedSigma = Math.min(0.003, Math.max(0.0001, empiricalVol * 0.38));
+
+  const quantileRows: number[][] = [];
+  for (let step = 1; step <= horizonMinutes; step++) {
+    const diffusionFactor = Math.pow(step, 0.6);
+    const quantileRow = Z.map((quantileZ) =>
+      price6(lastPrice + quantileZ * calibratedSigma * diffusionFactor)
+    );
+    quantileRows.push(quantileRow);
+  }
+  return quantileRows;
+}
+
+// Ensure output directory exists before generating predictions
+mkdirSync(OUTPUT_DIR, { recursive: true });
+const inputCases = readdirSync(INPUT_DIR).filter((fname) => fname.endsWith('.in')).sort();
+
+for (const caseFile of inputCases) {
+  const caseId = caseFile.slice(0, -'.in'.length);
+  const rawData = readFileSync(join(INPUT_DIR, caseFile), 'utf8');
+  const parsedCase = JSON.parse(rawData) as Case;
+
+  if (
+    parsedCase.quantiles.length !== QUANTILES.length ||
+    parsedCase.quantiles.some((val, idx) => val !== QUANTILES[idx])
+  ) {
+    throw new Error(`Incompatible quantiles specification detected in case file: ${caseFile}`);
+  }
+
+  const forecasts = parsedCase.markets.map((mkt) => ({
+    id: mkt.id,
+    q: forecastMarket(mkt, parsedCase.horizon_minutes)
+  }));
+
+  const resultPayload = JSON.stringify({ forecasts });
+  writeFileSync(join(OUTPUT_DIR, `${caseId}.out`), `${resultPayload}\n`);
 }
