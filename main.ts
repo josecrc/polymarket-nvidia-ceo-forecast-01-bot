@@ -23,8 +23,14 @@ interface Case {
   markets: CaseMarket[];
 }
 
-/** Clamp to [0, 1] and round to 6 decimal places strictly. */
-const price6 = (x: number): number => Math.round(Math.min(1, Math.max(0, x)) * 1e6) / 1e6 + 0;
+/**
+ * Strict probability clamping: clamps to [0, 1] interval and rounds to 6 decimal places.
+ * Ensures non-negative zero representation.
+ */
+const price6 = (x: number): number => {
+  const clamped = Math.min(1, Math.max(0, x));
+  return Math.round(clamped * 1e6) / 1e6 + 0;
+};
 
 /**
  * Adaptive forecasting model with realized volatility estimation.
@@ -34,7 +40,7 @@ function forecast(m: CaseMarket, horizon: number): number[][] {
   if (!p || p.length === 0) throw new Error(`Market ${m.id} has no prices`);
   const x = p[p.length - 1] as number;
 
-  // Window for realized volatility (up to 120 minutes)
+  // Estimate realized volatility using squared diffs over the trailing window (120 min max)
   const win = Math.min(p.length - 1, 120);
   let ssq = 0;
   for (let i = p.length - win; i < p.length; i++) {
@@ -42,11 +48,12 @@ function forecast(m: CaseMarket, horizon: number): number[][] {
     ssq += diff * diff;
   }
   const empiricalVol = win > 0 ? Math.sqrt(ssq / win) : 0.001;
-  // Optimized scale factor 0.38 with floor and cap
+  // Apply calibrated scaling parameter 0.38 with protective bounding
   const sigma = Math.min(0.003, Math.max(0.0001, empiricalVol * 0.38));
 
   const rows: number[][] = [];
   for (let h = 1; h <= horizon; h++) {
+    // Sublinear diffusion scaling Math.pow(h, 0.6) for fat tails and long-range clustering
     const diff = Math.pow(h, 0.6);
     const row = Z.map((z) => price6(x + z * sigma * diff));
     rows.push(row);
